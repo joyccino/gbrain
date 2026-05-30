@@ -2,6 +2,124 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.33.0] - 2026-05-29
+
+**`gbrain search` and `query` can now return a tight, intent-sized set of
+results instead of always handing back the full top-K pile. Opt-in, off by
+default, so nothing changes until you turn it on — and your agent can now flip
+it per query via a new `adaptive_return` flag on the `query` tool.**
+
+Most retrieval hands back the top 10-50 hits and lets you (or a downstream
+model) sort the wheat from the chaff. That is the right default for "show me
+everything related," but it is noisy when you asked a question that has one
+answer. The new `search.adaptive_return` knob makes retrieval return roughly
+as many results as the question deserves: a single-answer lookup gets a tight
+set, an enumeration query keeps the comparable cluster. Less noise for you
+reading results, a cleaner candidate set for any agent or `think` loop that
+consumes them, and lower downstream token spend.
+
+It is **off by default** and changes nothing until enabled. Turn it on:
+
+```bash
+gbrain config set search.adaptive_return true
+gbrain config set search.adaptive_return_entity_max 2   # cap for lookup-style queries
+gbrain config set search.adaptive_return_other_max 6    # cap for enumeration queries
+```
+
+The config knob is the human, set-and-forget path. **The agent path is the
+point:** the `query` MCP tool now takes an `adaptive_return` boolean, and its
+description tells the agent exactly when to use it — set it TRUE when the user
+asked something with a small, specific answer (a lookup, a single-fact recall,
+anything routed into a precise downstream step) so the user gets the answer
+instead of a wall of pages; leave it off for breadth ("everything about X",
+"list all", exploration) where recall matters more. The end user never touches a
+config knob — their agent decides per query, the same way it already decides
+`salience` and `recency`. Pass `limit: 1` alongside it for a hard single-answer
+cap. Library callers can also pass `SearchOpts.adaptiveReturn` (`true`, or
+`{ entityMax, otherMax, minKeep }`); defaults are 2 / 6 (recall-preserving).
+
+A few things we were careful about:
+
+- **It never hands back an empty result when there are candidates.** A human
+  searching always gets at least the top hit, no matter how tight the caps.
+- **It only fires on the first page** (`offset` 0). Paginating a
+  confidence-trimmed set is incoherent, so paged calls fall back to the fixed
+  limit.
+- **Recall is the tradeoff.** Returning fewer results can drop a legitimate
+  second or third answer, which is exactly why this ships off by default and
+  why the recall-preserving caps are the default when you do turn it on.
+- **The query cache is skipped while it is on** (a trimmed result set must not
+  be served to a gate-off lookup). Folding the gate into the cache key is a
+  follow-up; until then, adaptive-on calls always retrieve fresh.
+
+This came out of running gbrain against PrecisionMemBench (a precision-only
+memory benchmark) in the gbrain-evals repo. gbrain's default top-K retrieval
+scores low on raw precision there, as any top-K system does. With this feature
+on, gbrain lands second on that benchmark behind a purpose-built belief store.
+The measurement also killed a fancier idea: a "score cliff" detector turned out
+to carry no signal (the score gap after the top hit is the same whether the top
+hit is right or wrong), so the mechanism is a simple intent-driven cap, not a
+cliff cut.
+
+### To take advantage of v0.41.33.0
+
+`gbrain upgrade` handles this. There is no schema migration and no manual step.
+The feature is dormant until used.
+
+0. **Agents:** nothing to configure — the `query` tool's `adaptive_return`
+   param is live, and its description tells you when to set it. Reach for it on
+   single-answer questions; skip it on broad / exploratory ones.
+1. **Humans (set-and-forget, per-brain):**
+   ```bash
+   gbrain config set search.adaptive_return true
+   ```
+2. **Tune the caps** to taste, tighter for precision, looser for recall:
+   ```bash
+   gbrain config set search.adaptive_return_entity_max 2
+   gbrain config set search.adaptive_return_other_max 6
+   ```
+3. **Inspect what it did** on any query with `--json`: the `adaptive_return`
+   field in the search meta shows the intent, the cap, and how many results
+   were kept versus the full candidate count.
+4. **If results feel too thin,** raise the caps or set
+   `search.adaptive_return false` to return to the previous top-K behavior. No
+   data change either way.
+
+### Itemized changes
+
+**Adaptive return-sizing (new feature, default-off)**
+- `src/core/search/return-policy.ts` (new): pure module. `resolveAdaptiveReturn`
+  (defaults then config plane then per-call precedence), `applyAdaptiveReturn`
+  (intent-driven cap with an at-least-`minKeep` failsafe so it never empties a
+  non-empty result set), `adaptiveReturnFromConfig` (reads `search.adaptive_*`),
+  `adaptiveReturnEnabled`, and `DEFAULT_ADAPTIVE_RETURN` (`enabled:false`,
+  `entityMax:2`, `otherMax:6`, `minKeep:1`). The mechanism is an intent-driven
+  cap, not a score-cliff detector (the cliff carries no signal).
+- `src/core/search/hybrid.ts`: applies the gate after the reranker and before
+  the limit slice, only when enabled and `offset===0`, reading the
+  ordering-driving score. Stamps the decision into
+  `HybridSearchMeta.adaptive_return`. `hybridSearchCached` skips the cache when
+  the gate is on so a trimmed set is never served to a gate-off lookup
+  (KNOBS_HASH fold is a documented follow-up).
+- `src/core/types.ts`: `SearchOpts.adaptiveReturn` (`boolean` or partial config)
+  and `HybridSearchMeta.adaptive_return` (intent / cap / kept / total) for
+  `--json` and `--explain` consumers.
+- `src/core/operations.ts`: the **agent-facing surface** — `query` op gains an
+  `adaptive_return` boolean param whose description instructs the agent when to
+  use it (single-answer → on; breadth → off), matching the `salience`/`recency`
+  "YOU (the agent) decide" pattern. Threaded into `hybridSearchCached`.
+
+**Tests**
+- `test/search/return-policy.test.ts` (19 cases): config-resolution precedence,
+  intent-to-cap mapping, the never-empty failsafe, `minKeep > cap` recall floor,
+  and the default-off passthrough contract.
+- `test/search/query-op-adaptive-return.test.ts` (3 cases): pins the agent
+  surface — the `query` op exposes `adaptive_return` and its description teaches
+  both directions of the decision plus the never-empty safety contract.
+
+Measured against PrecisionMemBench in the sibling gbrain-evals repo (faithful
+vendored scorer); the default-off path is byte-identical to prior behavior (the
+existing search suite passes unchanged).
 ## [0.41.32.0] - 2026-05-30
 
 **A quiet repo that's fully caught up no longer screams `SEVERELY STALE` in
